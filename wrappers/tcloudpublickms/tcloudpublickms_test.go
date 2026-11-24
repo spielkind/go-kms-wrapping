@@ -53,8 +53,16 @@ func mustHaveEnv(t *testing.T) {
 	}
 
 	requireEnv(t, EnvTCloudPublicKmsKeyId)
-	requireEnv(t, EnvTCloudPublicAccessKey)
-	requireEnv(t, EnvTCloudPublicSecretKey)
+	switch os.Getenv(EnvTCloudPublicAuthMethod) {
+	case AuthMethodWorkloadIdentity:
+		// Run in a CCE pod with a projected service account token.
+		requireEnv(t, EnvTCloudPublicIdpId)
+	case AuthMethodECSAgency:
+		// Run on an ECS instance with an agency attached.
+	default:
+		requireEnv(t, EnvTCloudPublicAccessKey)
+		requireEnv(t, EnvTCloudPublicSecretKey)
+	}
 }
 
 func requireEnv(t *testing.T, key string) {

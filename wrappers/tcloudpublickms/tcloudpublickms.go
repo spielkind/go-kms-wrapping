@@ -6,14 +6,14 @@ package tcloudpublickms
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
-	"net/http"
 	"os"
+	"strings"
 	"sync/atomic"
 
 	wrapping "github.com/openbao/go-kms-wrapping/v2"
 	golangsdk "github.com/opentelekomcloud/gophertelekomcloud"
-	"github.com/opentelekomcloud/gophertelekomcloud/openstack"
 	kms "github.com/opentelekomcloud/gophertelekomcloud/openstack/kms/v1/keys"
 )
 
@@ -26,6 +26,21 @@ const (
 	EnvTCloudPublicAccessKey        = "TCLOUDPUBLIC_ACCESS_KEY"
 	EnvTCloudPublicSecretKey        = "TCLOUDPUBLIC_SECRET_KEY"
 	EnvTCloudPublicIdentityEndpoint = "TCLOUDPUBLIC_IDENTITY_ENDPOINT"
+	EnvTCloudPublicAuthMethod       = "TCLOUDPUBLIC_AUTH_METHOD"
+	EnvTCloudPublicIdpId            = "TCLOUDPUBLIC_IDP_ID"
+	EnvTCloudPublicIdTokenFile      = "TCLOUDPUBLIC_ID_TOKEN_FILE"
+)
+
+// Supported values of the auth_method configuration parameter.
+const (
+	// AuthMethodAccessKey authenticates with an access key and secret key.
+	AuthMethodAccessKey = "access_key"
+	// AuthMethodWorkloadIdentity exchanges the OIDC token of a Kubernetes
+	// service account (CCE workload identity) for an IAM token.
+	AuthMethodWorkloadIdentity = "workload_identity"
+	// AuthMethodECSAgency uses the temporary credentials of the agency
+	// attached to the ECS or BMS instance.
+	AuthMethodECSAgency = "ecs_agency"
 )
 
 // Ensure that we are implementing Wrapper
@@ -33,7 +48,7 @@ var _ wrapping.Wrapper = (*Wrapper)(nil)
 
 // Wrapper is a Wrapper that uses T Cloud Public's KMS
 type Wrapper struct {
-	client *golangsdk.ServiceClient
+	provider *clientProvider
 
 	// keyId is the configured key ID or alias. It is used to request
 	// encryption. We keep this separate from currentKeyId to support key
@@ -45,15 +60,20 @@ type Wrapper struct {
 
 	// Metadata fields stored for reporting
 	region string
-	// project is the T Cloud Public project/tenant scope.
+	// project is the ID of the T Cloud Public project/tenant scope.
 	// Optional; when empty, the global KMS endpoint is used.
-	project string
+	project    string
+	authMethod string
+
+	// metadataEndpoint is the ECS metadata service. Tests override it.
+	metadataEndpoint string
 }
 
 // NewWrapper creates a new TCloudPublic Wrapper
 func NewWrapper() *Wrapper {
 	k := &Wrapper{
-		currentKeyId: new(atomic.Value),
+		currentKeyId:     new(atomic.Value),
+		metadataEndpoint: defaultMetadataEndpoint,
 	}
 	k.currentKeyId.Store("")
 	return k
@@ -65,10 +85,25 @@ func NewWrapper() *Wrapper {
 // Order of precedence for T Cloud Public values (highest to lowest):
 // * Environment variable (if not disabled via WithDisallowEnvVars)
 // * Value from Vault configuration file
-// Required: key_id, region, access_key, secret_key
-// Optional: project (defaults to global scope), identity_endpoint
+// Required: key_id, region
+// Optional: project (defaults to global scope), identity_endpoint, auth_method
+//
+// project must be a project ID, such as 0123456789abcdef0123456789abcdef,
+// not a project name such as eu-de or eu-de_myproject.
+//
+// auth_method selects how to authenticate:
+// * access_key: requires access_key and secret_key
+// * workload_identity: exchanges the OIDC token of a Kubernetes service
+// account (CCE workload identity) for an IAM token scoped to project, or to
+// the project named like the region if project is empty. Requires idp_id;
+// id_token_file defaults to /var/run/secrets/tokens/oidc-token
+// * ecs_agency: uses the temporary credentials of the agency attached to the
+// ECS or BMS instance, served by the instance metadata service
+// If auth_method is empty, access_key is used if an access key or secret key
+// is set, otherwise workload_identity if idp_id is set. With
+// WithDisallowEnvVars, only access_key is allowed.
 func (k *Wrapper) SetConfig(
-	_ context.Context,
+	ctx context.Context,
 	opt ...wrapping.Option,
 ) (*wrapping.WrapperConfig, error) {
 	opts, err := getOpts(opt...)
@@ -86,7 +121,7 @@ func (k *Wrapper) SetConfig(
 		return nil, fmt.Errorf("'key_id' not found for T Cloud Public KMS wrapper configuration")
 	}
 
-	if err := k.setupClient(opts); err != nil {
+	if err := k.setupClient(ctx, opts); err != nil {
 		return nil, err
 	}
 
@@ -96,6 +131,7 @@ func (k *Wrapper) SetConfig(
 	wrapConfig.Metadata["region"] = k.region
 	wrapConfig.Metadata["project"] = k.project
 	wrapConfig.Metadata["key_id"] = k.keyId
+	wrapConfig.Metadata["auth_method"] = k.authMethod
 
 	return wrapConfig, nil
 }
@@ -114,7 +150,7 @@ func (k *Wrapper) KeyId(_ context.Context) (string, error) {
 // CMK. This returns the ciphertext, and/or any errors from this call. This
 // should be called after the KMS client has been instantiated.
 func (k *Wrapper) Encrypt(
-	_ context.Context,
+	ctx context.Context,
 	plaintext []byte,
 	opt ...wrapping.Option,
 ) (*wrapping.BlobInfo, error) {
@@ -129,13 +165,15 @@ func (k *Wrapper) Encrypt(
 
 	// We use k.keyId (the config) here so that if it is an alias, KMS resolves
 	// it to the latest version.
-	resp, err := kms.EncryptData(
-		k.client,
-		kms.EncryptDataOpts{
-			KeyID:     k.keyId,
-			PlainText: base64.StdEncoding.EncodeToString(env.Key),
-		},
-	)
+	resp, err := call(ctx, k.provider, func(client *golangsdk.ServiceClient) (*kms.EncryptResp, error) {
+		return kms.EncryptData(
+			client,
+			kms.EncryptDataOpts{
+				KeyID:     k.keyId,
+				PlainText: base64.StdEncoding.EncodeToString(env.Key),
+			},
+		)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("error encrypting data: %w", err)
 	}
@@ -155,16 +193,18 @@ func (k *Wrapper) Encrypt(
 
 // Decrypt is used to decrypt the ciphertext.
 func (k *Wrapper) Decrypt(
-	_ context.Context,
+	ctx context.Context,
 	in *wrapping.BlobInfo,
 	opt ...wrapping.Option,
 ) ([]byte, error) {
 	// KeyId is not passed to this call because T Cloud Public handles this
 	// internally based on the metadata stored with the encrypted data
-	resp, err := kms.DecryptData(
-		k.client,
-		kms.DecryptDataOpts{CipherText: string(in.KeyInfo.WrappedKey)},
-	)
+	resp, err := call(ctx, k.provider, func(client *golangsdk.ServiceClient) (*kms.DecryptResp, error) {
+		return kms.DecryptData(
+			client,
+			kms.DecryptDataOpts{CipherText: string(in.KeyInfo.WrappedKey)},
+		)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("error decrypting data encryption key: %w", err)
 	}
@@ -187,7 +227,7 @@ func (k *Wrapper) Decrypt(
 	return pt, nil
 }
 
-func (k *Wrapper) setupClient(opts *options) error {
+func (k *Wrapper) setupClient(ctx context.Context, opts *options) error {
 	switch {
 	case os.Getenv(EnvTCloudPublicRegion) != "" && !opts.Options.WithDisallowEnvVars:
 		k.region = os.Getenv(EnvTCloudPublicRegion)
@@ -206,74 +246,89 @@ func (k *Wrapper) setupClient(opts *options) error {
 		k.project = opts.withProject
 	}
 
-	var accessKey string
-	switch {
-	case os.Getenv(EnvTCloudPublicAccessKey) != "" && !opts.Options.WithDisallowEnvVars:
-		accessKey = os.Getenv(EnvTCloudPublicAccessKey)
-	case opts.withAccessKey != "":
-		accessKey = opts.withAccessKey
+	endpoint := configValue(opts, EnvTCloudPublicIdentityEndpoint, opts.withIdentityEndpoint)
+	accessKey := configValue(opts, EnvTCloudPublicAccessKey, opts.withAccessKey)
+	secretKey := configValue(opts, EnvTCloudPublicSecretKey, opts.withSecretKey)
+	idpId := configValue(opts, EnvTCloudPublicIdpId, opts.withIdpId)
+
+	authMethod := strings.ToLower(configValue(opts, EnvTCloudPublicAuthMethod, opts.withAuthMethod))
+	if authMethod == "" {
+		switch {
+		case accessKey != "" || secretKey != "":
+			authMethod = AuthMethodAccessKey
+		case idpId != "":
+			authMethod = AuthMethodWorkloadIdentity
+		default:
+			return errors.New("no credentials found for T Cloud Public KMS wrapper configuration: set 'access_key' and 'secret_key', set 'idp_id' for workload identity, or set 'auth_method'")
+		}
+	}
+	// As in other wrappers, identities provided by the environment, such as a
+	// token file or the metadata service, require environment variables to be
+	// allowed.
+	if opts.Options.WithDisallowEnvVars && authMethod != AuthMethodAccessKey {
+		return fmt.Errorf("auth method %q cannot be used when environment variables are disallowed", authMethod)
+	}
+
+	var source credentialSource
+	switch authMethod {
+	case AuthMethodAccessKey:
+		if accessKey == "" {
+			return fmt.Errorf("'access_key' not found for T Cloud Public KMS wrapper configuration")
+		}
+		if secretKey == "" {
+			return fmt.Errorf("'secret_key' not found for T Cloud Public KMS wrapper configuration")
+		}
+		source = &staticCredentials{authOpts: golangsdk.AKSKAuthOptions{
+			Region:           k.region,
+			ProjectId:        k.project,
+			AccessKey:        accessKey,
+			SecretKey:        secretKey,
+			IdentityEndpoint: endpoint,
+		}}
+	case AuthMethodWorkloadIdentity:
+		if idpId == "" {
+			return fmt.Errorf("'idp_id' not found for T Cloud Public KMS wrapper configuration")
+		}
+		tokenFile := configValue(opts, EnvTCloudPublicIdTokenFile, opts.withIdTokenFile)
+		if tokenFile == "" {
+			return fmt.Errorf("'id_token_file' not found for T Cloud Public KMS wrapper configuration")
+		}
+		source = &workloadIdentityCredentials{
+			identityEndpoint: endpoint,
+			idpId:            idpId,
+			tokenFile:        tokenFile,
+			projectId:        k.project,
+			projectName:      k.region,
+			httpClient:       newIAMHTTPClient(),
+		}
+	case AuthMethodECSAgency:
+		source = &ecsAgencyCredentials{
+			metadataEndpoint: k.metadataEndpoint,
+			identityEndpoint: endpoint,
+			region:           k.region,
+			project:          k.project,
+			httpClient:       newMetadataHTTPClient(),
+		}
 	default:
-		return fmt.Errorf("'access_key' not found for T Cloud Public KMS wrapper configuration")
+		return fmt.Errorf("unsupported auth method %q for T Cloud Public KMS wrapper configuration", authMethod)
 	}
 
-	var secretKey string
-	switch {
-	case os.Getenv(EnvTCloudPublicSecretKey) != "" && !opts.Options.WithDisallowEnvVars:
-		secretKey = os.Getenv(EnvTCloudPublicSecretKey)
-	case opts.withSecretKey != "":
-		secretKey = opts.withSecretKey
-	default:
-		return fmt.Errorf("'secret_key' not found for T Cloud Public KMS wrapper configuration")
-	}
-
-	var endpoint string
-	switch {
-	case os.Getenv(EnvTCloudPublicIdentityEndpoint) != "" && !opts.Options.WithDisallowEnvVars:
-		endpoint = os.Getenv(EnvTCloudPublicIdentityEndpoint)
-	case opts.withIdentityEndpoint != "":
-		endpoint = opts.withIdentityEndpoint
-	}
-
-	authOpts := golangsdk.AKSKAuthOptions{
-		Region:           k.region,
-		ProjectId:        k.project,
-		AccessKey:        accessKey,
-		SecretKey:        secretKey,
-		IdentityEndpoint: endpoint,
-	}
-
-	client, err := openstack.NewClient(authOpts.IdentityEndpoint)
-	if err != nil {
-		return fmt.Errorf("failed to create new client: %w", err)
-	}
-
-	// Configure the HTTP client to handle redirects with AK/SK resigning.
-	client.HTTPClient = http.Client{
-		Transport: client.HTTPClient.Transport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			golangsdk.ReSign(req, golangsdk.SignOptions{
-				AccessKey: accessKey,
-				SecretKey: secretKey,
-			})
-			return nil
-		},
-	}
-
-	err = openstack.Authenticate(client, authOpts)
-	if err != nil {
-		return fmt.Errorf("failed to authenticate: %w", err)
-	}
-
-	sc, err := openstack.NewKMSV1(
-		client, golangsdk.EndpointOpts{
-			Region:       authOpts.Region,
-			Availability: golangsdk.AvailabilityPublic,
-		},
-	)
-	if err != nil {
+	provider := newClientProvider(source, k.region, opts.WithLogger)
+	// Authenticate right away to surface configuration errors early.
+	if _, err := provider.get(ctx); err != nil {
 		return err
 	}
 
-	k.client = sc
+	k.provider = provider
+	k.authMethod = authMethod
 	return nil
+}
+
+// configValue returns the value of the environment variable env unless it is
+// empty or environment variables are disallowed, and value otherwise.
+func configValue(opts *options, env, value string) string {
+	if v := os.Getenv(env); v != "" && !opts.Options.WithDisallowEnvVars {
+		return v
+	}
+	return value
 }

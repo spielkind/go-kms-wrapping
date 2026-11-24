@@ -31,6 +31,12 @@ func getOpts(opt ...wrapping.Option) (*options, error) {
 			opts.withSecretKey = v
 		case "identity_endpoint":
 			opts.withIdentityEndpoint = v
+		case "auth_method":
+			opts.withAuthMethod = v
+		case "idp_id":
+			opts.withIdpId = v
+		case "id_token_file":
+			opts.withIdTokenFile = v
 		}
 	}
 
@@ -46,11 +52,15 @@ type options struct {
 	withProject          string
 	withAccessKey        string
 	withSecretKey        string
+	withAuthMethod       string
+	withIdpId            string
+	withIdTokenFile      string
 }
 
 func getDefaultOptions() options {
 	return options{
 		withIdentityEndpoint: "https://iam.eu-de.otc.t-systems.com:443/v3",
 		withRegion:           "eu-de",
+		withIdTokenFile:      "/var/run/secrets/tokens/oidc-token",
 	}
 }

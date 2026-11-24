@@ -5,6 +5,7 @@ go 1.24.0
 replace github.com/openbao/go-kms-wrapping/v2 => ../../
 
 require (
+	github.com/hashicorp/go-hclog v1.6.3
 	github.com/openbao/go-kms-wrapping/v2 v2.6.0
 	github.com/opentelekomcloud/gophertelekomcloud v0.9.5
 	github.com/stretchr/testify v1.10.0
@@ -13,7 +14,6 @@ require (
 require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/fatih/color v1.13.0 // indirect
-	github.com/hashicorp/go-hclog v1.6.3 // indirect
 	github.com/hashicorp/go-secure-stdlib/parseutil v0.2.0 // indirect
 	github.com/hashicorp/go-secure-stdlib/strutil v0.1.2 // indirect
 	github.com/hashicorp/go-sockaddr v1.0.7 // indirect
